@@ -4,9 +4,9 @@
   "type": "module",
   "description": "DealHunt API server + Amazon deal-fetching bot",
   "scripts": {
-    "start":      "node server/index.js",
-    "bot":        "node bot/fetchDeals.js",
-    "dev":        "node --watch server/index.js"
+    "start":      "node index.js",
+    "bot":        "node fetchDeals.js",
+    "dev":        "node --watch index.js"
   },
   "dependencies": {
     "cors":       "^2.8.5",
