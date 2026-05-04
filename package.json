@@ -1,0 +1,17 @@
+{
+  "name": "dealhunt-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "DealHunt API server + Amazon deal-fetching bot",
+  "scripts": {
+    "start":      "node server/index.js",
+    "bot":        "node bot/fetchDeals.js",
+    "dev":        "node --watch server/index.js"
+  },
+  "dependencies": {
+    "cors":       "^2.8.5",
+    "cron":       "^3.1.6",
+    "express":    "^4.18.2",
+    "node-fetch": "^3.3.2"
+  }
+}
