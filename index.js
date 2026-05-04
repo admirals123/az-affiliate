@@ -15,14 +15,15 @@ import { promisify } from "util";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DEALS_FILE = path.resolve(__dirname, "../data/deals.json");
-const BOT_SCRIPT = path.resolve(__dirname, "../bot/fetchDeals.js");
+const DEALS_FILE = path.resolve(__dirname, "data/deals.json");
+const BOT_SCRIPT = path.resolve(__dirname, "fetchDeals.js");
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
 app.use(cors({ origin: process.env.FRONTEND_URL || "http://localhost:3000" }));
 app.use(express.json());
+app.use(express.static(path.join(__dirname, "public")));
 
 // ─── Cache in memory to avoid disk reads per request ──────────────────────
 let cache = null;
@@ -39,6 +40,11 @@ async function loadDeals() {
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────
+// GET / — serve React frontend
+app.get("/", (_req, res) => {
+  res.sendFile(path.join(__dirname, "public", "index.html"));
+});
+
 // GET /api/deals  — return all deals (with optional filtering)
 app.get("/api/deals", (req, res) => {
   if (!cache) return res.status(503).json({ error: "Loading…" });
