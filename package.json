@@ -4,14 +4,15 @@
   "type": "module",
   "description": "DealHunt API server + Amazon deal-fetching bot",
   "scripts": {
-    "start":      "node index.js",
-    "bot":        "node fetchDeals.js",
-    "dev":        "node --watch index.js"
+    "start": "node index.js",
+    "bot": "node fetchDeals.js",
+    "dev": "node --watch index.js"
   },
   "dependencies": {
-    "cors":       "^2.8.5",
-    "cron":       "^3.1.6",
-    "express":    "^4.18.2",
-    "node-fetch": "^3.3.2"
+    "cors": "^2.8.5",
+    "cron": "^3.1.6",
+    "express": "^4.18.2",
+    "node-fetch": "^3.3.2",
+    "puppeteer": "^22.15.0"
   }
 }

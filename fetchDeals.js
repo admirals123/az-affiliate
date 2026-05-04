@@ -1,231 +1,220 @@
 /**
- * DealHunt Bot — Amazon Product Advertising API 5.0
- * Fetches deals across all categories and saves them to deals.json
+ * DealHunt Scraper — amazon.ca/deals & amazon.ca/gp/goldbox
+ * No Amazon PA API required. Runs via: node fetchDeals.js
  *
- * Setup:
- *   1. Sign up at https://affiliate-program.amazon.com
- *   2. Once approved, go to Tools → Product Advertising API
- *   3. Generate Access Key + Secret Key
- *   4. Fill in your credentials in .env
+ * Requires: npm install puppeteer
  */
 
-import crypto from "crypto";
-import fetch from "node-fetch";
+import puppeteer from "puppeteer";
 import fs from "fs/promises";
 import path from "path";
+import { fileURLToPath } from "url";
 
-// ─── Config ────────────────────────────────────────────────────────────────
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
 const CONFIG = {
-  accessKey:   process.env.AMAZON_ACCESS_KEY,
-  secretKey:   process.env.AMAZON_SECRET_KEY,
-  partnerTag:  process.env.AMAZON_PARTNER_TAG, // your-tag-20
-  host:        "webservices.amazon.ca",         // .ca for Canada, .com for US
-  region:      "ca-central-1",                  // ca-central-1 for Canada
-  outputFile:  path.resolve("./data/deals.json"),
-  minDiscount: 20,   // Only keep deals with at least 20% off
-  maxResults:  100,  // Items per category fetch
+  partnerTag:   process.env.AMAZON_PARTNER_TAG || "",
+  outputFile:   path.resolve(__dirname, "data/deals.json"),
+  minDiscount:  20,
+  scrollPasses: 8,   // scroll passes to trigger lazy-loaded deal cards
 };
 
-// Categories to search — PA API BrowseNode IDs for amazon.ca
-const CATEGORIES = [
-  { name: "Electronics",     browseNodeId: "667823011" },
-  { name: "Kitchen",         browseNodeId: "2404990011" },
-  { name: "Home",            browseNodeId: "2404991011" },
-  { name: "Fashion",         browseNodeId: "2206275011" },
-  { name: "Sports",          browseNodeId: "2206234011" },
-  { name: "Toys",            browseNodeId: "2206549011" },
-  { name: "Books",           browseNodeId: "916520" },
-  { name: "Health & Beauty", browseNodeId: "2206631011" },
-  { name: "Tools",           browseNodeId: "3561352011" },
-  { name: "Pet Supplies",    browseNodeId: "2402551011" },
+// Pages to scrape in order
+const SOURCES = [
+  { url: "https://www.amazon.ca/deals",      label: "Today's Deals" },
+  { url: "https://www.amazon.ca/gp/goldbox", label: "Gold Box"      },
 ];
 
-// ─── AWS Signature V4 ──────────────────────────────────────────────────────
-function sign(key, msg) {
-  return crypto.createHmac("sha256", key).update(msg).digest();
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// Scroll to the bottom incrementally so lazy-loaded cards appear
+async function autoScroll(page) {
+  await page.evaluate(async (passes) => {
+    for (let i = 0; i < passes; i++) {
+      window.scrollBy(0, window.innerHeight * 1.5);
+      await new Promise(r => setTimeout(r, 1200));
+    }
+    window.scrollTo(0, 0);
+  }, CONFIG.scrollPasses);
 }
 
-function getSignatureKey(secretKey, dateStamp, regionName, serviceName) {
-  const kDate    = sign(`AWS4${secretKey}`, dateStamp);
-  const kRegion  = sign(kDate, regionName);
-  const kService = sign(kRegion, serviceName);
-  return sign(kService, "aws4_request");
-}
+// Run inside the page context to pull structured deal data out of the DOM.
+// Amazon changes class names frequently, so we use multiple fallback selectors
+// at every step rather than relying on a single fragile path.
+function extractDealsFromDOM(partnerTag) {
+  const results = [];
+  const seen    = new Set();
 
-function buildAuthHeaders(payload) {
-  const now        = new Date();
-  const amzDate    = now.toISOString().replace(/[:-]|\.\d{3}/g, "").slice(0, 15) + "Z";
-  const dateStamp  = amzDate.slice(0, 8);
-  const service    = "ProductAdvertisingAPI";
-  const target     = "com.amazon.paapi5.v1.ProductAdvertisingAPIv1.SearchItems";
-  const endpoint   = `https://${CONFIG.host}/paapi5/searchitems`;
+  // Broad card selectors covering both the /deals React layout and /gp/goldbox
+  const cardSelectors = [
+    '[data-testid="deal-card"]',
+    '[class*="DealCard"]',
+    '[class*="dealItem"]',
+    ".GB-CARD",
+    ".a-section.octopus-dlp-asin-section",
+  ];
+  const cards = cardSelectors.flatMap(s => [...document.querySelectorAll(s)]);
 
-  const bodyHash = crypto.createHash("sha256").update(payload).digest("hex");
-
-  const canonicalHeaders = [
-    `content-encoding:amz-1.0`,
-    `content-type:application/json; charset=UTF-8`,
-    `host:${CONFIG.host}`,
-    `x-amz-date:${amzDate}`,
-    `x-amz-target:${target}`,
-  ].join("\n");
-
-  const signedHeaders = "content-encoding;content-type;host;x-amz-date;x-amz-target";
-
-  const canonicalRequest = [
-    "POST",
-    "/paapi5/searchitems",
-    "",
-    canonicalHeaders + "\n",
-    signedHeaders,
-    bodyHash,
-  ].join("\n");
-
-  const credScope    = `${dateStamp}/${CONFIG.region}/${service}/aws4_request`;
-  const strToSign    = `AWS4-HMAC-SHA256\n${amzDate}\n${credScope}\n${crypto.createHash("sha256").update(canonicalRequest).digest("hex")}`;
-  const signingKey   = getSignatureKey(CONFIG.secretKey, dateStamp, CONFIG.region, service);
-  const signature    = crypto.createHmac("sha256", signingKey).update(strToSign).digest("hex");
-
-  return {
-    "content-encoding": "amz-1.0",
-    "content-type": "application/json; charset=UTF-8",
-    "host": CONFIG.host,
-    "x-amz-date": amzDate,
-    "x-amz-target": target,
-    "Authorization": `AWS4-HMAC-SHA256 Credential=${CONFIG.accessKey}/${credScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
-  };
-}
-
-// ─── Fetch one category ────────────────────────────────────────────────────
-async function fetchCategory({ name, browseNodeId }) {
-  const payload = JSON.stringify({
-    PartnerTag:     CONFIG.partnerTag,
-    PartnerType:    "Associates",
-    Marketplace:    "www.amazon.ca",
-    BrowseNodeId:   browseNodeId,
-    SearchIndex:    "All",
-    ItemCount:      10,           // 1–10 per request (PA API limit)
-    Resources: [
-      "Images.Primary.Medium",
-      "ItemInfo.Title",
-      "Offers.Listings.Price",
-      "Offers.Listings.SavingBasis",
-      "Offers.Listings.DeliveryInfo.IsPrimeEligible",
-      "Offers.Summaries.LowestPrice",
-      "CustomerReviews.StarRating",
-      "CustomerReviews.Count",
-      "ItemInfo.ByLineInfo",
-    ],
-    SortBy: "Featured",
-  });
-
-  const headers = buildAuthHeaders(payload);
-
-  const res = await fetch(`https://${CONFIG.host}/paapi5/searchitems`, {
-    method: "POST",
-    headers,
-    body: payload,
-  });
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`PA API error for ${name}: ${res.status} — ${text}`);
-  }
-
-  const data = await res.json();
-  return parseItems(data, name);
-}
-
-// ─── Parse API response into our deal format ───────────────────────────────
-function parseItems(data, catName) {
-  const items = data?.SearchResult?.Items ?? [];
-  const deals = [];
-
-  for (const item of items) {
+  for (const card of cards) {
     try {
-      const listing   = item?.Offers?.Listings?.[0];
-      const priceObj  = listing?.Price;
-      const basisObj  = listing?.SavingBasis;
+      // ── ASIN ── (required — derived from the product link)
+      const link  = card.querySelector("a[href*='/dp/'], a[href*='/gp/product/']");
+      if (!link) continue;
+      const asinM = link.href.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/);
+      if (!asinM) continue;
+      const asin  = asinM[1];
+      if (seen.has(asin)) continue;
+      seen.add(asin);
 
-      if (!priceObj?.Amount || !basisObj?.Amount) continue;
+      // ── Title ──
+      const titleEl = card.querySelector(
+        '[data-testid="deal-title"], [class*="dealTitle"], [class*="DealTitle"], ' +
+        ".a-size-base-plus, .a-text-normal, .a-size-medium"
+      );
+      const title = titleEl?.textContent?.trim() || "Unknown Product";
 
-      const price = priceObj.Amount;
-      const was   = basisObj.Amount;
+      // ── Current price ── (.a-offscreen is the screen-reader text "$12.99")
+      const priceSpan = card.querySelector(
+        '.a-price:not([data-a-strike="true"]) .a-offscreen'
+      );
+      const price = priceSpan
+        ? parseFloat(priceSpan.textContent.replace(/[^0-9.]/g, ""))
+        : null;
+      if (!price) continue;
 
-      if (price >= was) continue; // no discount
-      const discountPct = Math.round((1 - price / was) * 100);
-      if (discountPct < CONFIG.minDiscount) continue;
+      // ── Was / list price ──
+      const wasSpan = card.querySelector(
+        '.a-price[data-a-strike="true"] .a-offscreen, ' +
+        ".a-text-strike .a-offscreen, " +
+        ".a-text-strike"
+      );
+      const was = wasSpan
+        ? parseFloat(wasSpan.textContent.replace(/[^0-9.]/g, ""))
+        : null;
+      if (!was || was <= price) continue;
 
-      const asin  = item.ASIN;
-      const title = item?.ItemInfo?.Title?.DisplayValue ?? "Unknown Product";
-      const image = item?.Images?.Primary?.Medium?.URL ?? null;
-      const prime = listing?.DeliveryInfo?.IsPrimeEligible ?? false;
+      // ── Discount % (badge first, computed fallback) ──
+      const badgeEl   = card.querySelector(
+        '[class*="badgeLabel"], [class*="badge-label"], ' +
+        ".savingsPercentage, [data-testid='deal-badge']"
+      );
+      const badgeNum  = badgeEl ? parseInt(badgeEl.textContent.replace(/[^0-9]/g, ""), 10) : NaN;
+      const discount  = Number.isFinite(badgeNum) && badgeNum > 0
+        ? badgeNum
+        : Math.round((1 - price / was) * 100);
 
-      const starRaw    = item?.CustomerReviews?.StarRating?.DisplayValue;
-      const reviewsRaw = item?.CustomerReviews?.Count?.DisplayValue;
-      const rating     = starRaw  ? parseFloat(starRaw)  : null;
-      const reviews    = reviewsRaw ? parseInt(reviewsRaw.replace(/,/g, ""), 10) : null;
+      // ── Image ──
+      const imgEl = card.querySelector("img");
+      const image = imgEl?.src || imgEl?.getAttribute("data-src") || null;
 
-      deals.push({
+      // ── Prime badge ──
+      const prime = !!(
+        card.querySelector(".a-icon-prime") ||
+        card.querySelector('[aria-label*="Prime"]') ||
+        card.querySelector('[class*="prime" i]')
+      );
+
+      // ── Category ──
+      const catEl = card.querySelector(
+        '[class*="category" i], [data-testid*="category"], [class*="Category"]'
+      );
+      const cat = catEl?.textContent?.trim() || "General";
+
+      results.push({
         asin,
         title,
-        cat: catName,
+        cat,
         image,
-        price: +price.toFixed(2),
-        was:   +was.toFixed(2),
-        discount: discountPct,
-        savings: +(was - price).toFixed(2),
+        price:    Math.round(price * 100) / 100,
+        was:      Math.round(was   * 100) / 100,
+        discount,
+        savings:  Math.round((was - price) * 100) / 100,
         prime,
-        rating,
-        reviews,
-        url: `https://www.amazon.ca/dp/${asin}?tag=${CONFIG.partnerTag}`,
+        rating:   null,
+        reviews:  null,
+        url:      `https://www.amazon.ca/dp/${asin}${partnerTag ? "?tag=" + partnerTag : ""}`,
         fetchedAt: new Date().toISOString(),
       });
-    } catch (_) {
-      continue;
-    }
+    } catch (_) { /* skip malformed card */ }
   }
 
-  return deals;
+  return results;
 }
 
-// ─── Rate-limit helper (PA API allows 1 req/sec) ──────────────────────────
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function scrapePage(page, source, partnerTag) {
+  await page.goto(source.url, { waitUntil: "networkidle2", timeout: 60_000 });
+  await sleep(2000);
+  await autoScroll(page);
+  await sleep(1000);
+  return page.evaluate(extractDealsFromDOM, partnerTag);
+}
 
-// ─── Main ─────────────────────────────────────────────────────────────────
 async function run() {
-  console.log("🤖  DealHunt Bot starting…");
-
-  if (!CONFIG.accessKey || !CONFIG.secretKey || !CONFIG.partnerTag) {
-    console.error("❌  Missing credentials. Check your .env file.");
-    process.exit(1);
+  console.log("🤖  DealHunt scraper starting…");
+  if (!CONFIG.partnerTag) {
+    console.warn("⚠️   AMAZON_PARTNER_TAG not set — affiliate links will have no tag");
   }
+
+  const browser = await puppeteer.launch({
+    headless: "new",
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-blink-features=AutomationControlled",
+    ],
+  });
+
+  const page = await browser.newPage();
+
+  // Mimic a real desktop Chrome session
+  await page.setUserAgent(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+  );
+  await page.setExtraHTTPHeaders({ "Accept-Language": "en-CA,en;q=0.9" });
+  // Hide the automation flag that some bot-detection scripts check
+  await page.evaluateOnNewDocument(() => {
+    Object.defineProperty(navigator, "webdriver", { get: () => false });
+  });
 
   const allDeals = [];
 
-  for (const cat of CATEGORIES) {
+  for (const source of SOURCES) {
     try {
-      console.log(`  ↳ Fetching ${cat.name}…`);
-      const deals = await fetchCategory(cat);
+      console.log(`  ↳ Scraping ${source.label} (${source.url})…`);
+      const deals = await scrapePage(page, source, CONFIG.partnerTag);
       allDeals.push(...deals);
       console.log(`    ✓ ${deals.length} deals found`);
     } catch (err) {
-      console.error(`    ✗ ${cat.name}: ${err.message}`);
+      console.error(`    ✗ ${source.label}: ${err.message}`);
     }
-    await sleep(1100); // 1 req/sec limit
+    // Polite delay between pages
+    await sleep(3000 + Math.random() * 2000);
   }
 
-  // Sort by discount descending
-  allDeals.sort((a, b) => b.discount - a.discount);
+  await browser.close();
+
+  // Deduplicate across pages, filter weak discounts, sort by discount
+  const seen = new Set();
+  const unique = allDeals.filter(d => {
+    if (seen.has(d.asin)) return false;
+    seen.add(d.asin);
+    return true;
+  });
+
+  const filtered = unique
+    .filter(d => d.discount >= CONFIG.minDiscount)
+    .sort((a, b) => b.discount - a.discount);
 
   await fs.mkdir(path.dirname(CONFIG.outputFile), { recursive: true });
   await fs.writeFile(CONFIG.outputFile, JSON.stringify({
     updatedAt: new Date().toISOString(),
-    count: allDeals.length,
-    deals: allDeals,
+    count:     filtered.length,
+    deals:     filtered,
   }, null, 2));
 
-  console.log(`\n✅  Done! ${allDeals.length} deals saved to ${CONFIG.outputFile}`);
+  console.log(`\n✅  Done! ${filtered.length} deals saved to ${CONFIG.outputFile}`);
 }
 
-run().catch((err) => { console.error(err); process.exit(1); });
+run().catch(err => { console.error(err); process.exit(1); });
